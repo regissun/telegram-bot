@@ -4,6 +4,7 @@ import re
 import requests
 import pandas as pd
 from datetime import datetime
+from flask import Flask, request
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 from openpyxl import Workbook, load_workbook
@@ -150,6 +151,10 @@ if __name__ == "__main__":
     application.add_handler(CommandHandler("list_dest", list_dest))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, reply))
 
-    # chạy webhook server của chính bot, không cần Flask
+    # chạy webhook server của chính bot
     application.run_webhook(
-        listen="0.0.0.
+        listen="0.0.0.0",
+        port=int(os.environ.get("PORT", 10000)),  # Render sẽ phát hiện port này
+        url_path="webhook",
+        webhook_url=f"https://{os.environ.get('RENDER_EXTERNAL_HOSTNAME')}/webhook"
+    )
