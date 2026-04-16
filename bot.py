@@ -4,7 +4,6 @@ import re
 import requests
 import pandas as pd
 from datetime import datetime
-from flask import Flask, request
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 from openpyxl import Workbook, load_workbook
@@ -143,28 +142,14 @@ async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(answer, parse_mode="HTML")
 
-# ====== Flask + Webhook ======
-app = Flask(__name__)
-application = ApplicationBuilder().token(TOKEN).build()
-application.add_handler(CommandHandler("start", start))
-application.add_handler(CommandHandler("help", help_command))
-application.add_handler(CommandHandler("list_dest", list_dest))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, reply))
-
-@app.route("/")
-def home():
-    return "Bot is alive!"
-
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    update = Update.de_json(request.get_json(force=True), application.bot)
-    application.update_queue.put_nowait(update)  # dùng put_nowait để tránh lỗi async
-    print(f"📩 Nhận update: {update.to_dict()}")
-    return "ok"
-
+# ====== Khởi động bot với webhook ======
 if __name__ == "__main__":
-    application.initialize()
-    application.start()
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
-    application.stop()
+    application = ApplicationBuilder().token(TOKEN).build()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("list_dest", list_dest))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, reply))
+
+    # chạy webhook server của chính bot, không cần Flask
+    application.run_webhook(
+        listen="0.0.0.
