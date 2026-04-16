@@ -158,7 +158,7 @@ def home():
 @app.route("/webhook", methods=["POST"])
 def webhook():
     update = Update.de_json(request.get_json(force=True), application.bot)
-    application.process_update(update)
+    application.update_queue.put_nowait(update)  # dùng put_nowait để tránh lỗi async
     print(f"📩 Nhận update: {update.to_dict()}")
     return "ok"
 
