@@ -15,7 +15,7 @@ OUTLOOK_LINK = "https://1drv.ms/x/c/63897167e619733d/IQAAsw4pLS6ZQ46oKJfSgbmRASM
 TACT_LINK = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSxJMSJZcwlD4ZUiY0a_N1KfeAyKp2HDUGzhXWA1wDxRkU1fFCU3BjfQZnquOEtwA/pubhtml?gid=248455740&single=true"
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-ONEDRIVE_SHORT_URL = os.getenv("ONEDRIVE_LINK")  # link ngắn OneDrive
+ONEDRIVE_SHORT_URL = os.getenv("ONEDRIVE_LINK")
 
 user_data = {}
 
@@ -164,6 +164,8 @@ def webhook():
 
 if __name__ == "__main__":
     # Khởi động dispatcher để xử lý update song song với Flask
-    application.run_async()
+    application.initialize()
+    application.start()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+    application.stop()
