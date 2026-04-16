@@ -159,8 +159,11 @@ def home():
 def webhook():
     update = Update.de_json(request.get_json(force=True), application.bot)
     application.update_queue.put(update)
+    print(f"📩 Nhận update: {update.to_dict()}")
     return "ok"
 
 if __name__ == "__main__":
+    # Khởi động dispatcher để xử lý update song song với Flask
+    application.run_async()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
