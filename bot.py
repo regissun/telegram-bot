@@ -4,11 +4,10 @@ import re
 import requests
 import pandas as pd
 from datetime import datetime
-from flask import Flask
+from flask import Flask, request
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 from openpyxl import Workbook, load_workbook
-import threading
 
 # ====== Cấu hình ======
 LOG_FILE = "bot_user_log.xlsx"
@@ -16,7 +15,7 @@ OUTLOOK_LINK = "https://1drv.ms/x/c/63897167e619733d/IQAAsw4pLS6ZQ46oKJfSgbmRASM
 TACT_LINK = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSxJMSJZcwlD4ZUiY0a_N1KfeAyKp2HDUGzhXWA1wDxRkU1fFCU3BjfQZnquOEtwA/pubhtml?gid=248455740&single=true"
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-ONEDRIVE_SHORT_URL = os.getenv("ONEDRIVE_LINK")  # bạn paste link ngắn vào Render
+ONEDRIVE_SHORT_URL = os.getenv("ONEDRIVE_LINK")  # link ngắn OneDrive
 
 user_data = {}
 
@@ -144,26 +143,24 @@ async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(answer, parse_mode="HTML")
 
-# ====== Flask endpoint để giữ bot sống ======
+# ====== Flask + Webhook ======
 app = Flask(__name__)
+application = ApplicationBuilder().token(TOKEN).build()
+application.add_handler(CommandHandler("start", start))
+application.add_handler(CommandHandler("help", help_command))
+application.add_handler(CommandHandler("list_dest", list_dest))
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, reply))
 
 @app.route("/")
 def home():
     return "Bot is alive!"
 
-def run_bot():
-    application = ApplicationBuilder().token(TOKEN).build()
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("list_dest", list_dest))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, reply))
-
-    print("✅ Bot đã khởi động, đang chờ tin nhắn...")
-    application.run_polling()
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    update = Update.de_json(request.get_json(force=True), application.bot)
+    application.update_queue.put(update)
+    return "ok"
 
 if __name__ == "__main__":
-    # Chạy bot trong thread riêng
-    threading.Thread(target=run_bot).start()
-    # Mở Flask để Render thấy có port
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
