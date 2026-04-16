@@ -152,7 +152,7 @@ def home():
 
 import asyncio
 
-def main():
+async def main():
     application = ApplicationBuilder().token(TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
@@ -160,7 +160,7 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, reply))
 
     print("✅ Bot đã khởi động, đang chờ tin nhắn...")
-    asyncio.run(application.run_polling())
+    await application.run_polling()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
