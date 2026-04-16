@@ -8,6 +8,7 @@ from flask import Flask
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 from openpyxl import Workbook, load_workbook
+import threading
 
 # ====== Cấu hình ======
 LOG_FILE = "bot_user_log.xlsx"
@@ -31,7 +32,7 @@ def get_direct_onedrive_link(short_url: str) -> str:
 
 DIRECT_URL = get_direct_onedrive_link(ONEDRIVE_SHORT_URL)
 
-def load_excel_from_onedrive(sheet_name="Sheet1"):
+def load_excel_from_onedrive(sheet_name=" "):  # sheet name là dấu cách
     response = requests.get(DIRECT_URL)
     response.raise_for_status()
     return pd.read_excel(io.BytesIO(response.content), sheet_name=sheet_name, header=None)
@@ -70,7 +71,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def list_dest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        df = load_excel_from_onedrive(sheet_name="Sheet1")
+        df = load_excel_from_onedrive(sheet_name=" ")
         dest_values = df[1].dropna().unique()
         dest_list = ", ".join(sorted(dest_values.astype(str)))
         answer = f"📋 Danh sách tất cả Dest trong cột B:\n{dest_list}"
@@ -102,7 +103,7 @@ async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_log(user_id, user_data[user_id]["name"], user_data[user_id]["company"], text, timestamp)
 
     try:
-        df = load_excel_from_onedrive(sheet_name="Sheet1")
+        df = load_excel_from_onedrive(sheet_name=" ")
         row = df[df[1].astype(str).str.strip().str.lower() == text.lower()]
 
         if not row.empty:
@@ -150,7 +151,7 @@ app = Flask(__name__)
 def home():
     return "Bot is alive!"
 
-def main():
+def run_bot():
     application = ApplicationBuilder().token(TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
@@ -158,7 +159,11 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, reply))
 
     print("✅ Bot đã khởi động, đang chờ tin nhắn...")
-    application.run_polling()   # chạy trực tiếp, không asyncio.run()
+    application.run_polling()
 
 if __name__ == "__main__":
-    main()
+    # Chạy bot trong thread riêng
+    threading.Thread(target=run_bot).start()
+    # Mở Flask để Render thấy có port
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
