@@ -150,6 +150,8 @@ app = Flask(__name__)
 def home():
     return "Bot is alive!"
 
+import asyncio
+
 def main():
     application = ApplicationBuilder().token(TOKEN).build()
     application.add_handler(CommandHandler("start", start))
@@ -158,7 +160,7 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, reply))
 
     print("✅ Bot đã khởi động, đang chờ tin nhắn...")
-    application.run_polling()
+    asyncio.run(application.run_polling())
 
 if __name__ == "__main__":
     main()
