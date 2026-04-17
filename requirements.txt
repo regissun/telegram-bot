@@ -1,5 +1,6 @@
+python-telegram-bot>=20.0
+Flask
+requests
 pandas
 openpyxl
-python-telegram-bot==20.0
-requests
-flask
+
