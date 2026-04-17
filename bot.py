@@ -5,7 +5,9 @@ import base64
 import requests
 import pandas as pd
 import asyncio
+import threading
 from datetime import datetime
+from flask import Flask, request, abort
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -15,14 +17,13 @@ from telegram.ext import (
     filters,
 )
 from openpyxl import Workbook, load_workbook
-from aiohttp import web
 
 # ====== Cấu hình ======
 LOG_FILE = "bot_user_log.xlsx"
 OUTLOOK_LINK = "https://1drv.ms/x/c/63897167e619733d/IQAAsw4pLS6ZQ46oKJfSgbmRASMpiNzmZcrm1cKRWGwB1Tc?e=cTvuRI"
 TACT_LINK = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSxJMSJZcwlD4ZUiY0a_N1KfeAyKp2HDUGzhXWA1wDxRkU1fFCU3BjfQZnquOEtwA/pubhtml?gid=248455740&single=true"
 
-# Env vars (bạn đã cấu hình RENDER_URL trên Render)
+# Env vars
 TOKEN = os.getenv("TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
 ONEDRIVE_URL = os.getenv("ONEDRIVE_URL") or os.getenv("ONEDRIVE_LINK")
 RENDER_URL = os.getenv("RENDER_URL")  # e.g. "https://telegram-bot-o4h8.onrender.com"
@@ -36,11 +37,49 @@ if not ONEDRIVE_URL:
 if not RENDER_URL:
     raise RuntimeError("Missing RENDER_URL environment variable.")
 
-# ====== State ======
+# ====== Global state ======
+application = None
 user_data = {}
+
+# ====== Flask app for webhook + health-check ======
+flask_app = Flask(__name__)
+
+@flask_app.route("/", methods=["GET", "HEAD"])
+def health():
+    return "Bot is alive!"
+
+@flask_app.route(f"/{WEBHOOK_PATH}", methods=["POST"])
+def webhook_receiver():
+    """
+    Receive Telegram webhook POST from Telegram (synchronous Flask route).
+    Convert JSON to Update and push into application's update_queue synchronously.
+    """
+    global application
+    if application is None:
+        # Not ready yet
+        abort(503, "Bot not ready")
+    try:
+        data = request.get_json(force=True)
+        update = Update.de_json(data, application.bot)
+        # put_nowait is synchronous and safe here
+        application.update_queue.put_nowait(update)
+        return "ok"
+    except Exception as e:
+        # Return 200 to Telegram if you prefer, but log error
+        print("Error handling webhook POST:", e)
+        abort(400, str(e))
+
+def run_flask():
+    # Run Flask dev server only for health and webhook receiving.
+    # Render will map external port to container port.
+    flask_app.run(host="0.0.0.0", port=PORT)
 
 # ====== OneDrive helper (sheet name is single space " ") ======
 def get_direct_link(share_url: str) -> str:
+    """
+    Convert OneDrive share URL to direct download via onedrive API share token.
+    Uses base64 'u!' encoding approach.
+    """
     encoded = base64.b64encode(share_url.encode()).decode()
     encoded = encoded.rstrip("=").replace("/", "_").replace("+", "-")
     return f"https://api.onedrive.com/v1.0/shares/u!{encoded}/root/content"
@@ -48,12 +87,13 @@ def get_direct_link(share_url: str) -> str:
 DIRECT_URL = get_direct_link(ONEDRIVE_URL)
 
 def load_excel_from_onedrive(sheet_name=" "):
-    try:
-        resp = requests.get(DIRECT_URL, timeout=30)
-        resp.raise_for_status()
-        return pd.read_excel(io.BytesIO(resp.content), sheet_name=sheet_name, header=None)
-    except Exception as e:
-        raise RuntimeError(f"Failed to download/read Excel from OneDrive: {e}")
+    """
+    Download workbook and read the sheet named single-space " ".
+    Returns pandas DataFrame with header=None.
+    """
+    resp = requests.get(DIRECT_URL, timeout=30)
+    resp.raise_for_status()
+    return pd.read_excel(io.BytesIO(resp.content), sheet_name=sheet_name, header=None)
 
 # ====== Ghi log vào Excel cục bộ ======
 def save_log(user_id, name, company, question, timestamp):
@@ -162,7 +202,7 @@ async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(answer, parse_mode="HTML")
 
-# ====== Build application and aiohttp app for webhook ======
+# ====== Build application ======
 def build_application():
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
@@ -171,35 +211,60 @@ def build_application():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, reply))
     return app
 
-def build_aiohttp_app():
-    aio_app = web.Application()
-    # health endpoint for UptimeRobot
-    async def health(request):
-        return web.Response(text="Bot is alive!")
-    aio_app.router.add_get("/", health)
-    return aio_app
+# ====== Helper: set webhook via Telegram API ======
+def set_telegram_webhook(webhook_url: str):
+    """
+    Call Telegram setWebhook synchronously. Raise on failure.
+    """
+    url = f"https://api.telegram.org/bot{TOKEN}/setWebhook"
+    resp = requests.post(url, data={"url": webhook_url}, timeout=15)
+    try:
+        resp.raise_for_status()
+    except Exception as e:
+        raise RuntimeError(f"Failed to setWebhook: {e} - {resp.text}")
+    j = resp.json()
+    if not j.get("ok"):
+        raise RuntimeError(f"setWebhook returned not ok: {j}")
 
-# ====== Entrypoint: run webhook with aiohttp app ======
-if __name__ == "__main__":
+# ====== Entrypoint: run application in asyncio main thread and Flask in background thread ======
+async def main_async():
+    global application
     application = build_application()
-    aio_app = build_aiohttp_app()
 
+    # compute webhook URL
     webhook_url = RENDER_URL.rstrip("/") + f"/{WEBHOOK_PATH}"
     print("Webhook URL will be:", webhook_url)
-    print("Starting webhook server on port", PORT)
 
-    # run_webhook is a coroutine in some versions; ensure we run it inside asyncio.run
-    async def _run():
-        # run_webhook will start aiohttp server using webhook_app
-        await application.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            url_path=WEBHOOK_PATH,
-            webhook_url=webhook_url,
-            webhook_app=aio_app,
-        )
-
+    # Try to set webhook (best-effort). If fails, print error but continue.
     try:
-        asyncio.run(_run())
+        set_telegram_webhook(webhook_url)
+        print("✅ Telegram webhook set to:", webhook_url)
     except Exception as e:
-        print("Fatal error running webhook:", e)
+        print("⚠️ setWebhook failed:", e)
+
+    # Initialize and start application (registers handlers and starts dispatcher)
+    await application.initialize()
+    await application.start()
+    print("✅ Application initialized and started")
+
+    # Start Flask server in background thread to receive webhook POSTs and health checks
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    print(f"✅ Flask started on port {PORT} (health + webhook receiver)")
+
+    # Keep running until cancelled
+    try:
+        await asyncio.Event().wait()
+    finally:
+        # graceful shutdown
+        await application.stop()
+        await application.shutdown()
+        print("Application stopped")
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main_async())
+    except KeyboardInterrupt:
+        print("Interrupted, exiting")
+    except Exception as e:
+        print("Fatal error in main:", e)
