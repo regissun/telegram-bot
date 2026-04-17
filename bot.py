@@ -4,26 +4,34 @@ import base64
 import requests
 import pandas as pd
 from datetime import datetime
-from flask import Flask, request
-from telegram import Update, Bot
+from flask import Flask
+from threading import Thread
+from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 from openpyxl import Workbook, load_workbook
-import asyncio
-import threading
 
 # ====== Cấu hình ======
 LOG_FILE = "bot_user_log.xlsx"
 OUTLOOK_LINK = "https://1drv.ms/x/c/63897167e619733d/IQAAsw4pLS6ZQ46oKJfSgbmRASMpiNzmZcrm1cKRWGwB1Tc?e=cTvuRI"
 TACT_LINK = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSxJMSJZcwlD4ZUiY0a_N1KfeAyKp2HDUGzhXWA1wDxRkU1fFCU3BjfQZnquOEtwA/pubhtml?gid=248455740&single=true"
 
-# ⚠️ Sửa lỗi 1: đúng tên biến môi trường trên Render
 TOKEN = os.getenv("TOKEN")
 ONEDRIVE_URL = os.getenv("ONEDRIVE_URL")
-RENDER_URL = os.getenv("RENDER_URL")  # thêm biến này trên Render (xem hướng dẫn bên dưới)
 
 user_data = {}
 
-# ====== Hàm đọc OneDrive ======
+# ====== Flask giữ bot không ngủ ======
+flask_app = Flask(__name__)
+
+@flask_app.route("/")
+def home():
+    return "Bot is alive!"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    flask_app.run(host="0.0.0.0", port=port)
+
+# ====== Đọc OneDrive ======
 def get_direct_link(share_url):
     encoded = base64.b64encode(share_url.encode()).decode()
     encoded = encoded.rstrip("=").replace("/", "_").replace("+", "-")
@@ -62,7 +70,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "- /start: Bắt đầu trò chuyện với bot.\n"
         "- /list_dest: Liệt kê toàn bộ mã Dest trong cột B.\n"
         "- /help: Hiển thị hướng dẫn chi tiết.\n\n"
-        "Sau khi nhập đủ thông tin, gõ mã Dest (ví dụ: SIN, CGK, BKK, KUL) để tra cứu."
+        "Sau khi nhập đủ thông tin, gõ mã Dest (ví dụ: SIN, CGK, BKK) để tra cứu."
     )
     await update.message.reply_text(answer)
 
@@ -141,37 +149,17 @@ async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(answer, parse_mode="HTML")
 
-# ====== Flask + Webhook ======
-flask_app = Flask(__name__)
-application = ApplicationBuilder().token(TOKEN).build()
-application.add_handler(CommandHandler("start", start))
-application.add_handler(CommandHandler("help", help_command))
-application.add_handler(CommandHandler("list_dest", list_dest))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, reply))
-
-@flask_app.route("/")
-def home():
-    return "Bot is alive!"
-
-# ⚠️ Sửa lỗi 2+4: xử lý webhook đúng cách
-@flask_app.route("/webhook", methods=["POST"])
-def webhook():
-    asyncio.run(
-        application.process_update(
-            Update.de_json(request.get_json(force=True), application.bot)
-        )
-    )
-    return "ok"
-
-# ⚠️ Sửa lỗi 2: đăng ký webhook với Telegram khi app khởi động
-async def setup():
-    await application.initialize()
-    await application.start()
-    webhook_url = f"{RENDER_URL}/webhook"
-    await application.bot.set_webhook(webhook_url)
-    print(f"✅ Webhook đã đăng ký: {webhook_url}")
-
+# ====== Chạy bot ======
 if __name__ == "__main__":
-    asyncio.run(setup())
-    port = int(os.environ.get("PORT", 5000))
-    flask_app.run(host="0.0.0.0", port=port)
+    # Flask chạy thread riêng để giữ bot không ngủ
+    Thread(target=run_flask, daemon=True).start()
+    print("✅ Flask đang chạy")
+
+    # Bot dùng polling, không cần webhook
+    app = ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("list_dest", list_dest))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, reply))
+    print("✅ Bot polling bắt đầu...")
+    app.run_polling()
