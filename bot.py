@@ -1,40 +1,39 @@
 import os
 import io
-import re
+import base64
 import requests
 import pandas as pd
 from datetime import datetime
 from flask import Flask, request
-from telegram import Update
+from telegram import Update, Bot
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 from openpyxl import Workbook, load_workbook
+import asyncio
+import threading
 
 # ====== Cấu hình ======
 LOG_FILE = "bot_user_log.xlsx"
 OUTLOOK_LINK = "https://1drv.ms/x/c/63897167e619733d/IQAAsw4pLS6ZQ46oKJfSgbmRASMpiNzmZcrm1cKRWGwB1Tc?e=cTvuRI"
 TACT_LINK = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSxJMSJZcwlD4ZUiY0a_N1KfeAyKp2HDUGzhXWA1wDxRkU1fFCU3BjfQZnquOEtwA/pubhtml?gid=248455740&single=true"
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-ONEDRIVE_SHORT_URL = os.getenv("ONEDRIVE_LINK")
+# ⚠️ Sửa lỗi 1: đúng tên biến môi trường trên Render
+TOKEN = os.getenv("TOKEN")
+ONEDRIVE_URL = os.getenv("ONEDRIVE_URL")
+RENDER_URL = os.getenv("RENDER_URL")  # thêm biến này trên Render (xem hướng dẫn bên dưới)
 
 user_data = {}
 
-# ====== Hàm xử lý OneDrive ======
-def get_direct_onedrive_link(short_url: str) -> str:
-    resp = requests.get(short_url, allow_redirects=True)
-    final_url = resp.url
-    match = re.search(r"resid=([^&]+)", final_url)
-    if not match:
-        raise ValueError("Không tìm thấy resid trong link OneDrive")
-    resid = match.group(1)
-    return f"https://onedrive.live.com/download?resid={resid}"
+# ====== Hàm đọc OneDrive ======
+def get_direct_link(share_url):
+    encoded = base64.b64encode(share_url.encode()).decode()
+    encoded = encoded.rstrip("=").replace("/", "_").replace("+", "-")
+    return f"https://api.onedrive.com/v1.0/shares/u!{encoded}/root/content"
 
-DIRECT_URL = get_direct_onedrive_link(ONEDRIVE_SHORT_URL)
-
-def load_excel_from_onedrive(sheet_name=" "):  # sheet name là dấu cách
-    response = requests.get(DIRECT_URL)
+def load_excel_from_onedrive():
+    direct_url = get_direct_link(ONEDRIVE_URL)
+    response = requests.get(direct_url)
     response.raise_for_status()
-    return pd.read_excel(io.BytesIO(response.content), sheet_name=sheet_name, header=None)
+    return pd.read_excel(io.BytesIO(response.content), sheet_name=" ", header=None)
 
 # ====== Ghi log ======
 def save_log(user_id, name, company, question, timestamp):
@@ -60,22 +59,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     answer = (
         "📖 Hướng dẫn sử dụng bot:\n\n"
-        "- /start: Bắt đầu trò chuyện với bot (yêu cầu nhập Tên và Công ty).\n"
+        "- /start: Bắt đầu trò chuyện với bot.\n"
         "- /list_dest: Liệt kê toàn bộ mã Dest trong cột B.\n"
         "- /help: Hiển thị hướng dẫn chi tiết.\n\n"
-        "Sau khi nhập đủ thông tin, bạn có thể gõ trực tiếp mã Dest (ví dụ: SIN, CGK, BKK, KUL) "
-        "để nhận thông tin chi tiết."
+        "Sau khi nhập đủ thông tin, gõ mã Dest (ví dụ: SIN, CGK, BKK, KUL) để tra cứu."
     )
     await update.message.reply_text(answer)
 
 async def list_dest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        df = load_excel_from_onedrive(sheet_name=" ")
+        df = load_excel_from_onedrive()
         dest_values = df[1].dropna().unique()
         dest_list = ", ".join(sorted(dest_values.astype(str)))
-        answer = f"📋 Danh sách tất cả Dest trong cột B:\n{dest_list}"
+        answer = f"📋 Danh sách tất cả Dest:\n{dest_list}"
     except Exception as e:
-        answer = f"⚠️ Có lỗi xảy ra khi đọc file: {e}"
+        answer = f"⚠️ Có lỗi xảy ra: {e}"
     await update.message.reply_text(answer)
 
 async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -95,14 +93,14 @@ async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if user_id not in user_data or user_data[user_id].get("step") != "done":
-        await update.message.reply_text("⚠️ Vui lòng nhập Tên và Công ty trước bằng lệnh /start.")
+        await update.message.reply_text("⚠️ Vui lòng nhập /start trước.")
         return
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     save_log(user_id, user_data[user_id]["name"], user_data[user_id]["company"], text, timestamp)
 
     try:
-        df = load_excel_from_onedrive(sheet_name=" ")
+        df = load_excel_from_onedrive()
         row = df[df[1].astype(str).str.strip().str.lower() == text.lower()]
 
         if not row.empty:
@@ -133,7 +131,7 @@ async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             answer = (
                 "Xin lỗi, chưa có dữ liệu cho giá trị này.\n"
-                "👉 Bạn có thể dùng lệnh /list_dest để xem danh sách Dest có sẵn.\n\n"
+                "👉 Dùng /list_dest để xem danh sách Dest có sẵn.\n\n"
                 f"🔗 <a href='{OUTLOOK_LINK}'>Space Outlook</a>\n"
                 f"🔗 <a href='{TACT_LINK}'>TACT Rate</a>"
             )
@@ -143,18 +141,37 @@ async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(answer, parse_mode="HTML")
 
-# ====== Khởi động bot với webhook ======
-if __name__ == "__main__":
-    application = ApplicationBuilder().token(TOKEN).build()
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("list_dest", list_dest))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, reply))
+# ====== Flask + Webhook ======
+flask_app = Flask(__name__)
+application = ApplicationBuilder().token(TOKEN).build()
+application.add_handler(CommandHandler("start", start))
+application.add_handler(CommandHandler("help", help_command))
+application.add_handler(CommandHandler("list_dest", list_dest))
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, reply))
 
-    # chạy webhook server của chính bot
-    application.run_webhook(
-        listen="0.0.0.0",
-        port=int(os.environ.get("PORT", 10000)),  # Render sẽ phát hiện port này
-        url_path="webhook",
-        webhook_url=f"https://{os.environ.get('RENDER_EXTERNAL_HOSTNAME')}/webhook"
+@flask_app.route("/")
+def home():
+    return "Bot is alive!"
+
+# ⚠️ Sửa lỗi 2+4: xử lý webhook đúng cách
+@flask_app.route("/webhook", methods=["POST"])
+def webhook():
+    asyncio.run(
+        application.process_update(
+            Update.de_json(request.get_json(force=True), application.bot)
+        )
     )
+    return "ok"
+
+# ⚠️ Sửa lỗi 2: đăng ký webhook với Telegram khi app khởi động
+async def setup():
+    await application.initialize()
+    await application.start()
+    webhook_url = f"{RENDER_URL}/webhook"
+    await application.bot.set_webhook(webhook_url)
+    print(f"✅ Webhook đã đăng ký: {webhook_url}")
+
+if __name__ == "__main__":
+    asyncio.run(setup())
+    port = int(os.environ.get("PORT", 5000))
+    flask_app.run(host="0.0.0.0", port=port)
