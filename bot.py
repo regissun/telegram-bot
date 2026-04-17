@@ -22,19 +22,19 @@ LOG_FILE = "bot_user_log.xlsx"
 OUTLOOK_LINK = "https://1drv.ms/x/c/63897167e619733d/IQAAsw4pLS6ZQ46oKJfSgbmRASMpiNzmZcrm1cKRWGwB1Tc?e=cTvuRI"
 TACT_LINK = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSxJMSJZcwlD4ZUiY0a_N1KfeAyKp2HDUGzhXWA1wDxRkU1fFCU3BjfQZnquOEtwA/pubhtml?gid=248455740&single=true"
 
-# NOTE: giữ tên biến môi trường giống bạn đang dùng
-TOKEN = os.getenv("TOKEN")  # hoặc TELEGRAM_BOT_TOKEN nếu bạn đổi env
+# Env vars (giữ tên giống bạn đang dùng)
+TOKEN = os.getenv("TOKEN")  # token Telegram
 ONEDRIVE_URL = os.getenv("ONEDRIVE_URL")  # link chia sẻ OneDrive
+PORT = int(os.environ.get("PORT", 10000))
 
 if not TOKEN:
     raise RuntimeError("Missing TELEGRAM token. Set environment variable TOKEN.")
-
 if not ONEDRIVE_URL:
     raise RuntimeError("Missing ONEDRIVE_URL environment variable.")
 
 user_data = {}
 
-# ====== Flask cho UptimeRobot (health check) ======
+# ====== Flask health-check (UptimeRobot) ======
 flask_app = Flask(__name__)
 
 @flask_app.route("/")
@@ -42,15 +42,14 @@ def home():
     return "Bot is alive!"
 
 def run_flask():
-    port = int(os.environ.get("PORT", 10000))
-    # Use 0.0.0.0 so Render can route external traffic
-    flask_app.run(host="0.0.0.0", port=port)
+    # Flask dev server is fine for health-check; run in background thread
+    flask_app.run(host="0.0.0.0", port=PORT)
 
-# ====== Đọc OneDrive (giữ sheet name là dấu cách " ") ======
+# ====== OneDrive helper (sheet name is single space " ") ======
 def get_direct_link(share_url: str) -> str:
     """
     Convert OneDrive share URL to direct download via onedrive API share token.
-    This uses the 'u!' base64 encoding approach.
+    Uses base64 'u!' encoding approach.
     """
     encoded = base64.b64encode(share_url.encode()).decode()
     encoded = encoded.rstrip("=").replace("/", "_").replace("+", "-")
@@ -59,10 +58,6 @@ def get_direct_link(share_url: str) -> str:
 DIRECT_URL = get_direct_link(ONEDRIVE_URL)
 
 def load_excel_from_onedrive(sheet_name=" "):
-    """
-    Download the workbook and read the sheet named " " (single space).
-    Returns a pandas DataFrame with header=None to match your original layout.
-    """
     resp = requests.get(DIRECT_URL, timeout=30)
     resp.raise_for_status()
     return pd.read_excel(io.BytesIO(resp.content), sheet_name=sheet_name, header=None)
@@ -80,7 +75,6 @@ def save_log(user_id, name, company, question, timestamp):
         ws.append([user_id, name, company, question, timestamp])
         wb.save(LOG_FILE)
     except Exception as e:
-        # Không raise để bot không crash vì lỗi ghi log
         print(f"❌ Lỗi ghi log: {e}")
 
 # ====== Handlers ======
@@ -139,7 +133,6 @@ async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Lookup
     try:
         df = load_excel_from_onedrive(sheet_name=" ")
-        # match ignoring case and whitespace
         row = df[df[1].astype(str).str.strip().str.lower() == text.lower()]
 
         if not row.empty:
@@ -179,43 +172,29 @@ async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(answer, parse_mode="HTML")
 
-# ====== Hàm chạy bot (polling) trong thread riêng ======
-def start_polling_in_thread():
-    """
-    Build Application and run polling inside asyncio.run in this thread.
-    Using asyncio.run ensures a fresh event loop is created for the thread,
-    avoiding 'no current event loop' errors.
-    """
-    async def _run():
-        app = ApplicationBuilder().token(TOKEN).build()
-        app.add_handler(CommandHandler("start", start))
-        app.add_handler(CommandHandler("help", help_command))
-        app.add_handler(CommandHandler("list_dest", list_dest))
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, reply))
+# ====== Khởi động bot (polling) trong main thread ======
+async def run_bot_polling():
+    app = ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("list_dest", list_dest))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, reply))
 
-        # run_polling is a coroutine in v20+, asyncio.run will execute it
-        await app.run_polling()
-
-    # Run the async runner in this thread
-    asyncio.run(_run())
-
-def run_bot_thread():
-    t = threading.Thread(target=start_polling_in_thread, daemon=True)
-    t.start()
-    print("✅ Bot polling thread started")
+    print("✅ Bot polling starting (main thread)...")
+    # run_polling will register signal handlers (OK in main thread)
+    await app.run_polling()
 
 # ====== Entrypoint ======
 if __name__ == "__main__":
-    # Start Flask in a daemon thread so Render/UptimeRobot can ping /
+    # Start Flask health-check in background thread
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
-    print("✅ Flask health endpoint started")
+    print("✅ Flask health endpoint started on port", PORT)
 
-    # Start bot polling in background thread (async loop created inside thread)
-    run_bot_thread()
-
-    # Keep main thread alive (join on flask thread)
+    # Run bot polling in main thread event loop
     try:
-        flask_thread.join()
+        asyncio.run(run_bot_polling())
     except KeyboardInterrupt:
-        print("Shutting down")
+        print("Shutting down by KeyboardInterrupt")
+    except Exception as e:
+        print("Fatal error in bot polling:", e)
