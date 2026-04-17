@@ -1,5 +1,5 @@
 # bot.py
-import os
+import os PAUSE BOT HERE
 import io
 import base64
 import requests
