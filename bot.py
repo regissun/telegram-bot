@@ -4,18 +4,8 @@ import io
 import base64
 import requests
 import pandas as pd
-import asyncio
-import threading
 from datetime import datetime
-from flask import Flask, request, abort
-from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
+from flask import Flask, request, abort, jsonify
 from openpyxl import Workbook, load_workbook
 
 # ====== Cấu hình ======
@@ -23,7 +13,7 @@ LOG_FILE = "bot_user_log.xlsx"
 OUTLOOK_LINK = "https://1drv.ms/x/c/63897167e619733d/IQAAsw4pLS6ZQ46oKJfSgbmRASMpiNzmZcrm1cKRWGwB1Tc?e=cTvuRI"
 TACT_LINK = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSxJMSJZcwlD4ZUiY0a_N1KfeAyKp2HDUGzhXWA1wDxRkU1fFCU3BjfQZnquOEtwA/pubhtml?gid=248455740&single=true"
 
-# Env vars
+# Env vars (bạn đã cấu hình RENDER_URL trên Render)
 TOKEN = os.getenv("TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
 ONEDRIVE_URL = os.getenv("ONEDRIVE_URL") or os.getenv("ONEDRIVE_LINK")
 RENDER_URL = os.getenv("RENDER_URL")  # e.g. "https://telegram-bot-o4h8.onrender.com"
@@ -38,41 +28,39 @@ if not RENDER_URL:
     raise RuntimeError("Missing RENDER_URL environment variable.")
 
 # ====== Global state ======
-application = None
-user_data = {}
+user_data = {}  # {user_id: {"step": "name"/"company"/"done", "name":..., "company":...}}
 
-# ====== Flask app for webhook + health-check ======
-flask_app = Flask(__name__)
+# ====== Flask app (health + webhook receiver) ======
+app = Flask(__name__)
 
-@flask_app.route("/", methods=["GET", "HEAD"])
+@app.route("/", methods=["GET", "HEAD"])
 def health():
     return "Bot is alive!"
 
-@flask_app.route(f"/{WEBHOOK_PATH}", methods=["POST"])
+@app.route(f"/{WEBHOOK_PATH}", methods=["POST"])
 def webhook_receiver():
     """
-    Receive Telegram webhook POST from Telegram (synchronous Flask route).
-    Convert JSON to Update and push into application's update_queue synchronously.
+    Synchronous webhook receiver.
+    Parse incoming update JSON and handle message synchronously,
+    then reply via Telegram sendMessage API.
     """
-    global application
-    if application is None:
-        # Not ready yet
-        abort(503, "Bot not ready")
     try:
         data = request.get_json(force=True)
-        update = Update.de_json(data, application.bot)
-        # put_nowait is synchronous and safe here
-        application.update_queue.put_nowait(update)
-        return "ok"
     except Exception as e:
-        # Return 200 to Telegram if you prefer, but log error
-        print("Error handling webhook POST:", e)
-        abort(400, str(e))
+        print("Invalid JSON in webhook POST:", e)
+        abort(400)
 
-def run_flask():
-    # Run Flask dev server only for health and webhook receiving.
-    # Render will map external port to container port.
-    flask_app.run(host="0.0.0.0", port=PORT)
+    # Only handle message updates (ignore other update types for now)
+    if "message" not in data:
+        # respond 200 so Telegram doesn't retry too aggressively
+        return jsonify({"ok": True, "note": "no message"}), 200
+
+    try:
+        handle_update_sync(data)
+    except Exception as e:
+        # Log error but return 200 to Telegram to avoid retries
+        print("Error handling update:", e)
+    return jsonify({"ok": True}), 200
 
 # ====== OneDrive helper (sheet name is single space " ") ======
 def get_direct_link(share_url: str) -> str:
@@ -110,56 +98,90 @@ def save_log(user_id, name, company, question, timestamp):
     except Exception as e:
         print(f"❌ Lỗi ghi log: {e}")
 
-# ====== Handlers ======
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user_data[user_id] = {"step": "name"}
-    await update.message.reply_text("Xin chào! Vui lòng nhập Tên của bạn:")
+# ====== Telegram send helper (synchronous) ======
+TELEGRAM_API = f"https://api.telegram.org/bot{TOKEN}"
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    answer = (
-        "📖 Hướng dẫn sử dụng bot:\n\n"
-        "- /start: Bắt đầu (yêu cầu nhập Tên và Công ty).\n"
-        "- /list_dest: Liệt kê toàn bộ mã Dest trong cột B.\n"
-        "- /help: Hiển thị hướng dẫn.\n\n"
-        "Sau khi nhập Tên và Công ty, gõ mã Dest (ví dụ: SIN, CGK) để tra cứu."
-    )
-    await update.message.reply_text(answer)
-
-async def list_dest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def send_message(chat_id: int, text: str, parse_mode: str = None):
+    payload = {"chat_id": chat_id, "text": text}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+        payload["disable_web_page_preview"] = True
     try:
-        df = load_excel_from_onedrive(sheet_name=" ")
-        dest_values = df[1].dropna().unique()
-        dest_list = ", ".join(sorted(dest_values.astype(str)))
-        answer = f"📋 Danh sách tất cả Dest trong cột B:\n{dest_list}"
+        resp = requests.post(f"{TELEGRAM_API}/sendMessage", data=payload, timeout=15)
+        resp.raise_for_status()
+        return resp.json()
     except Exception as e:
-        answer = f"⚠️ Lỗi khi đọc file: {e}"
-    await update.message.reply_text(answer)
+        print("Failed to send message:", e, resp.text if 'resp' in locals() else "")
+        return None
 
-async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    text = (update.message.text or "").strip()
-    if not text:
+# ====== Core synchronous update handling (keeps same UX as before) ======
+def handle_update_sync(update_json: dict):
+    msg = update_json.get("message", {})
+    if not msg:
         return
 
-    if user_id in user_data and user_data[user_id].get("step") == "name":
+    chat = msg.get("chat", {})
+    from_user = msg.get("from", {})
+    chat_id = chat.get("id")
+    user_id = from_user.get("id")
+    text = msg.get("text", "").strip() if msg.get("text") else ""
+
+    if not chat_id or not user_id:
+        return
+
+    # Commands
+    if text.startswith("/start"):
+        user_data[user_id] = {"step": "name"}
+        send_message(chat_id, "Xin chào! Vui lòng nhập Tên của bạn:")
+        return
+
+    if text.startswith("/help"):
+        help_text = (
+            "📖 Hướng dẫn sử dụng bot:\n\n"
+            "- /start: Bắt đầu trò chuyện với bot (yêu cầu nhập Tên và Công ty).\n"
+            "- /list_dest: Liệt kê toàn bộ mã Dest trong cột B.\n"
+            "- /help: Hiển thị hướng dẫn chi tiết.\n\n"
+            "Sau khi nhập đủ thông tin, bạn có thể gõ trực tiếp mã Dest (ví dụ: SIN, CGK, BKK, KUL) "
+            "để nhận thông tin chi tiết."
+        )
+        send_message(chat_id, help_text)
+        return
+
+    if text.startswith("/list_dest"):
+        try:
+            df = load_excel_from_onedrive(sheet_name=" ")
+            dest_values = df[1].dropna().unique()
+            dest_list = ", ".join(sorted(dest_values.astype(str)))
+            answer = f"📋 Danh sách tất cả Dest trong cột B:\n{dest_list}"
+        except Exception as e:
+            answer = f"⚠️ Có lỗi xảy ra khi đọc file: {e}"
+        send_message(chat_id, answer)
+        return
+
+    # Conversation flow: name -> company -> done
+    state = user_data.get(user_id, {})
+    step = state.get("step")
+
+    if step == "name":
+        # Save name, ask company
         user_data[user_id]["name"] = text
         user_data[user_id]["step"] = "company"
-        await update.message.reply_text("Cảm ơn! Bây giờ hãy nhập Tên công ty:")
+        send_message(chat_id, "Cảm ơn! Bây giờ hãy nhập Tên công ty:")
         return
 
-    if user_id in user_data and user_data[user_id].get("step") == "company":
+    if step == "company":
         user_data[user_id]["company"] = text
         user_data[user_id]["step"] = "done"
-        await update.message.reply_text("✅ Đã lưu thông tin. Giờ bạn có thể nhập mã Dest để tra cứu.")
+        send_message(chat_id, "✅ Đã lưu thông tin. Giờ bạn có thể nhập mã Dest để tra cứu.")
         return
 
-    if user_id not in user_data or user_data[user_id].get("step") != "done":
-        await update.message.reply_text("⚠️ Vui lòng nhập Tên và Công ty trước bằng lệnh /start.")
+    if step != "done":
+        send_message(chat_id, "⚠️ Vui lòng nhập Tên và Công ty trước bằng lệnh /start.")
         return
 
+    # Now user is in 'done' state: treat text as Dest query
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    save_log(user_id, user_data[user_id]["name"], user_data[user_id]["company"], text, timestamp)
+    save_log(user_id, user_data[user_id].get("name", ""), user_data[user_id].get("company", ""), text, timestamp)
 
     try:
         df = load_excel_from_onedrive(sheet_name=" ")
@@ -200,71 +222,31 @@ async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         answer = f"⚠️ Có lỗi xảy ra khi tra cứu: {e}"
 
-    await update.message.reply_text(answer, parse_mode="HTML")
+    send_message(chat_id, answer, parse_mode="HTML")
 
-# ====== Build application ======
-def build_application():
-    app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("list_dest", list_dest))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, reply))
-    return app
-
-# ====== Helper: set webhook via Telegram API ======
+# ====== Helper: set webhook via Telegram API (synchronous) ======
 def set_telegram_webhook(webhook_url: str):
-    """
-    Call Telegram setWebhook synchronously. Raise on failure.
-    """
     url = f"https://api.telegram.org/bot{TOKEN}/setWebhook"
     resp = requests.post(url, data={"url": webhook_url}, timeout=15)
-    try:
-        resp.raise_for_status()
-    except Exception as e:
-        raise RuntimeError(f"Failed to setWebhook: {e} - {resp.text}")
+    resp.raise_for_status()
     j = resp.json()
     if not j.get("ok"):
         raise RuntimeError(f"setWebhook returned not ok: {j}")
+    return j
 
-# ====== Entrypoint: run application in asyncio main thread and Flask in background thread ======
-async def main_async():
-    global application
-    application = build_application()
-
-    # compute webhook URL
+# ====== Entrypoint ======
+if __name__ == "__main__":
     webhook_url = RENDER_URL.rstrip("/") + f"/{WEBHOOK_PATH}"
     print("Webhook URL will be:", webhook_url)
 
-    # Try to set webhook (best-effort). If fails, print error but continue.
+    # Try to set webhook (best-effort)
     try:
-        set_telegram_webhook(webhook_url)
+        res = set_telegram_webhook(webhook_url)
         print("✅ Telegram webhook set to:", webhook_url)
     except Exception as e:
-        print("⚠️ setWebhook failed:", e)
+        print("⚠️ setWebhook failed (will still run):", e)
 
-    # Initialize and start application (registers handlers and starts dispatcher)
-    await application.initialize()
-    await application.start()
-    print("✅ Application initialized and started")
-
-    # Start Flask server in background thread to receive webhook POSTs and health checks
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    print(f"✅ Flask started on port {PORT} (health + webhook receiver)")
-
-    # Keep running until cancelled
-    try:
-        await asyncio.Event().wait()
-    finally:
-        # graceful shutdown
-        await application.stop()
-        await application.shutdown()
-        print("Application stopped")
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main_async())
-    except KeyboardInterrupt:
-        print("Interrupted, exiting")
-    except Exception as e:
-        print("Fatal error in main:", e)
+    # Start Flask (this will receive webhook POSTs and health checks)
+    # Use Flask dev server here; Render maps external port to container port.
+    print("Starting Flask on port", PORT)
+    app.run(host="0.0.0.0", port=PORT)
