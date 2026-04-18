@@ -2,6 +2,7 @@
 import os
 import io
 import re
+import time
 import json
 import requests
 import pandas as pd
@@ -15,12 +16,15 @@ OUTLOOK_LINK = os.getenv("OUTLOOK_LINK", "")
 TACT_LINK = os.getenv("TACT_LINK", "")
 
 TOKEN = os.getenv("TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
-GOOGLE_DRIVE_URL = os.getenv("GOOGLE_DRIVE_URL")  # direct download link or share link
+GOOGLE_DRIVE_URL = os.getenv("GOOGLE_DRIVE_URL")  # share link or export link
 GOOGLE_DRIVE_FILE_ID = os.getenv("GOOGLE_DRIVE_FILE_ID")  # optional explicit file id
-GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")  # optional for future
 RENDER_URL = os.getenv("RENDER_URL")
 PORT = int(os.environ.get("PORT", 10000))
 WEBHOOK_PATH = "webhook"
+
+# Retry config
+MAX_RETRIES = int(os.getenv("DOWNLOAD_MAX_RETRIES", "4"))
+BACKOFF_FACTOR = float(os.getenv("DOWNLOAD_BACKOFF_FACTOR", "1.5"))
 
 if not TOKEN:
     raise RuntimeError("Missing TELEGRAM token. Set environment variable TOKEN.")
@@ -54,7 +58,7 @@ def webhook_receiver():
         print("Error handling update:", e)
     return jsonify({"ok": True}), 200
 
-# ====== Google Drive helpers ======
+# ====== Helpers for Google Sheets / Drive ======
 def _extract_drive_file_id(url: str):
     if not url:
         return None
@@ -66,6 +70,73 @@ def _extract_drive_file_id(url: str):
         return m.group(1)
     return None
 
+def _is_google_sheets_url(url: str):
+    return bool(url and "docs.google.com/spreadsheets" in url)
+
+def _build_sheets_export_url(url: str, format="xlsx"):
+    """
+    Convert a Google Sheets share/edit URL to an export URL that returns an xlsx file.
+    Example:
+    https://docs.google.com/spreadsheets/d/<FILEID>/edit?usp=sharing
+    -> https://docs.google.com/spreadsheets/d/<FILEID>/export?format=xlsx
+    """
+    fid = _extract_drive_file_id(url)
+    if not fid:
+        return None
+    return f"https://docs.google.com/spreadsheets/d/{fid}/export?format={format}"
+
+def _get_confirm_token_from_response(resp_text: str):
+    m = re.search(r"confirm=([0-9A-Za-z_]+)&", resp_text)
+    if m:
+        return m.group(1)
+    m2 = re.search(r"confirm=([0-9A-Za-z_]+)\\u0026", resp_text)
+    if m2:
+        return m2.group(1)
+    return None
+
+def _download_with_confirm_and_retries(dl_url: str):
+    session = requests.Session()
+    headers = {"User-Agent": "python-requests/2.x"}
+    attempt = 0
+    last_exc = None
+
+    while attempt < MAX_RETRIES:
+        try:
+            attempt += 1
+            print(f"[Drive] download attempt {attempt} for {dl_url}")
+            resp = session.get(dl_url, headers=headers, allow_redirects=True, timeout=30)
+            content_type = resp.headers.get("Content-Type", "")
+            status = resp.status_code
+            print(f"[Drive] status {status} content-type {content_type}")
+            if status == 200 and "text/html" not in content_type.lower():
+                return resp.content
+
+            text = resp.text or ""
+            token = _get_confirm_token_from_response(text)
+            if token:
+                fid = _extract_drive_file_id(dl_url) or _extract_drive_file_id(GOOGLE_DRIVE_URL or "")
+                if not fid:
+                    raise RuntimeError("Cannot determine file id for confirm flow.")
+                confirm_url = f"https://drive.google.com/uc?export=download&id={fid}&confirm={token}"
+                print(f"[Drive] retrying with confirm token, url: {confirm_url}")
+                resp2 = session.get(confirm_url, headers=headers, allow_redirects=True, timeout=30)
+                resp2.raise_for_status()
+                ct2 = resp2.headers.get("Content-Type", "")
+                print(f"[Drive] confirm response status {resp2.status_code} content-type {ct2}")
+                if "text/html" in ct2.lower():
+                    raise RuntimeError("Google returned HTML even after confirm token.")
+                return resp2.content
+
+            raise RuntimeError(f"Google returned HTML page (status {status}).")
+
+        except Exception as e:
+            last_exc = e
+            wait = BACKOFF_FACTOR ** attempt
+            print(f"[Drive] attempt {attempt} failed: {repr(e)}; retrying in {wait:.1f}s")
+            time.sleep(wait)
+
+    raise RuntimeError(f"Download failed after {MAX_RETRIES} attempts. Last error: {repr(last_exc)}")
+
 def _download_via_direct_link(url: str):
     fid = _extract_drive_file_id(url)
     if fid:
@@ -73,19 +144,25 @@ def _download_via_direct_link(url: str):
     else:
         dl = url
     print(f"[Drive] Trying direct download URL: {dl}")
-    resp = requests.get(dl, allow_redirects=True, timeout=30)
-    resp.raise_for_status()
-    content_type = resp.headers.get("Content-Type", "")
-    print(f"[Drive] direct download status {resp.status_code} content-type {content_type}")
-    return resp.content
-
-def _download_via_service_account(file_id: str):
-    # Placeholder for future secure mode; not used in Quick mode
-    raise RuntimeError("Service account download not configured in Quick mode.")
+    content = _download_with_confirm_and_retries(dl)
+    return content
 
 def load_excel_from_google_drive(sheet_name=" "):
     last_exc = None
-    # 1) Try direct download if URL provided
+
+    # If it's a Google Sheets URL, convert to export xlsx
+    if _is_google_sheets_url(GOOGLE_DRIVE_URL):
+        export_url = _build_sheets_export_url(GOOGLE_DRIVE_URL, format="xlsx")
+        if export_url:
+            try:
+                content = _download_with_confirm_and_retries(export_url)
+                print("[Drive] downloaded via Google Sheets export URL")
+                return pd.read_excel(io.BytesIO(content), sheet_name=sheet_name, header=None)
+            except Exception as e:
+                last_exc = e
+                print("[Drive] sheets export download failed:", repr(e))
+
+    # 1) Try direct download if URL provided (Drive file)
     if GOOGLE_DRIVE_URL:
         try:
             content = _download_via_direct_link(GOOGLE_DRIVE_URL)
@@ -95,12 +172,12 @@ def load_excel_from_google_drive(sheet_name=" "):
             last_exc = e
             print("[Drive] direct download failed:", repr(e))
 
-    # 2) Try explicit file id with direct uc link
+    # 2) Try explicit file id with uc link
     fid = GOOGLE_DRIVE_FILE_ID or _extract_drive_file_id(GOOGLE_DRIVE_URL or "")
     if fid:
         try:
             dl = f"https://drive.google.com/uc?export=download&id={fid}"
-            content = _download_via_direct_link(dl)
+            content = _download_with_confirm_and_retries(dl)
             print("[Drive] downloaded via explicit file id")
             return pd.read_excel(io.BytesIO(content), sheet_name=sheet_name, header=None)
         except Exception as e:
@@ -112,9 +189,9 @@ def load_excel_from_google_drive(sheet_name=" "):
         "Possible causes:\n"
         "- The share link is not set to Anyone with the link.\n"
         "- Google returned an HTML page (virus scan or preview) instead of file.\n"
-        "- The link is not a direct download link.\n\n"
+        "- The link is not a direct download link or Google throttled requests.\n\n"
         "Fix options:\n"
-        "1) Make file shareable Anyone with the link and set GOOGLE_DRIVE_URL to the uc?export=download link.\n"
+        "1) Ensure the file is shared 'Anyone with the link' and set GOOGLE_DRIVE_URL to the export link: https://docs.google.com/spreadsheets/d/<FILEID>/export?format=xlsx\n"
         "2) Provide GOOGLE_DRIVE_FILE_ID and ensure the file is shared.\n"
     ).format(last_exc)
     raise RuntimeError(guidance)
