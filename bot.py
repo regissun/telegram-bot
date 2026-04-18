@@ -1,7 +1,8 @@
 # bot.py
-import os PAUSE BOT HERE
+import os
 import io
-import base64
+import re
+import json
 import requests
 import pandas as pd
 from datetime import datetime
@@ -10,27 +11,26 @@ from openpyxl import Workbook, load_workbook
 
 # ====== Cấu hình ======
 LOG_FILE = "bot_user_log.xlsx"
-OUTLOOK_LINK = "https://1drv.ms/x/c/63897167e619733d/IQAAsw4pLS6ZQ46oKJfSgbmRASMpiNzmZcrm1cKRWGwB1Tc?e=cTvuRI"
-TACT_LINK = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSxJMSJZcwlD4ZUiY0a_N1KfeAyKp2HDUGzhXWA1wDxRkU1fFCU3BjfQZnquOEtwA/pubhtml?gid=248455740&single=true"
+OUTLOOK_LINK = os.getenv("OUTLOOK_LINK", "")
+TACT_LINK = os.getenv("TACT_LINK", "")
 
-# Env vars (bạn đã cấu hình RENDER_URL trên Render)
 TOKEN = os.getenv("TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
-ONEDRIVE_URL = os.getenv("ONEDRIVE_URL") or os.getenv("ONEDRIVE_LINK")
-RENDER_URL = os.getenv("RENDER_URL")  # e.g. "https://telegram-bot-o4h8.onrender.com"
+GOOGLE_DRIVE_URL = os.getenv("GOOGLE_DRIVE_URL")  # direct download link or share link
+GOOGLE_DRIVE_FILE_ID = os.getenv("GOOGLE_DRIVE_FILE_ID")  # optional explicit file id
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")  # optional for future
+RENDER_URL = os.getenv("RENDER_URL")
 PORT = int(os.environ.get("PORT", 10000))
-WEBHOOK_PATH = "webhook"  # final path: /webhook
+WEBHOOK_PATH = "webhook"
 
 if not TOKEN:
     raise RuntimeError("Missing TELEGRAM token. Set environment variable TOKEN.")
-if not ONEDRIVE_URL:
-    raise RuntimeError("Missing ONEDRIVE_URL environment variable.")
 if not RENDER_URL:
     raise RuntimeError("Missing RENDER_URL environment variable.")
 
 # ====== Global state ======
-user_data = {}  # {user_id: {"step": "name"/"company"/"done", "name":..., "company":...}}
+user_data = {}
 
-# ====== Flask app (health + webhook receiver) ======
+# ====== Flask app ======
 app = Flask(__name__)
 
 @app.route("/", methods=["GET", "HEAD"])
@@ -39,51 +39,87 @@ def health():
 
 @app.route(f"/{WEBHOOK_PATH}", methods=["POST"])
 def webhook_receiver():
-    """
-    Synchronous webhook receiver.
-    Parse incoming update JSON and handle message synchronously,
-    then reply via Telegram sendMessage API.
-    """
     try:
         data = request.get_json(force=True)
     except Exception as e:
         print("Invalid JSON in webhook POST:", e)
         abort(400)
 
-    # Only handle message updates (ignore other update types for now)
     if "message" not in data:
-        # respond 200 so Telegram doesn't retry too aggressively
         return jsonify({"ok": True, "note": "no message"}), 200
 
     try:
         handle_update_sync(data)
     except Exception as e:
-        # Log error but return 200 to Telegram to avoid retries
         print("Error handling update:", e)
     return jsonify({"ok": True}), 200
 
-# ====== OneDrive helper (sheet name is single space " ") ======
-def get_direct_link(share_url: str) -> str:
-    """
-    Convert OneDrive share URL to direct download via onedrive API share token.
-    Uses base64 'u!' encoding approach.
-    """
-    encoded = base64.b64encode(share_url.encode()).decode()
-    encoded = encoded.rstrip("=").replace("/", "_").replace("+", "-")
-    return f"https://api.onedrive.com/v1.0/shares/u!{encoded}/root/content"
+# ====== Google Drive helpers ======
+def _extract_drive_file_id(url: str):
+    if not url:
+        return None
+    m = re.search(r"/d/([a-zA-Z0-9_-]+)", url)
+    if m:
+        return m.group(1)
+    m = re.search(r"id=([a-zA-Z0-9_-]+)", url)
+    if m:
+        return m.group(1)
+    return None
 
-DIRECT_URL = get_direct_link(ONEDRIVE_URL)
-
-def load_excel_from_onedrive(sheet_name=" "):
-    """
-    Download workbook and read the sheet named single-space " ".
-    Returns pandas DataFrame with header=None.
-    """
-    resp = requests.get(DIRECT_URL, timeout=30)
+def _download_via_direct_link(url: str):
+    fid = _extract_drive_file_id(url)
+    if fid:
+        dl = f"https://drive.google.com/uc?export=download&id={fid}"
+    else:
+        dl = url
+    print(f"[Drive] Trying direct download URL: {dl}")
+    resp = requests.get(dl, allow_redirects=True, timeout=30)
     resp.raise_for_status()
-    return pd.read_excel(io.BytesIO(resp.content), sheet_name=sheet_name, header=None)
+    content_type = resp.headers.get("Content-Type", "")
+    print(f"[Drive] direct download status {resp.status_code} content-type {content_type}")
+    return resp.content
 
-# ====== Ghi log vào Excel cục bộ ======
+def _download_via_service_account(file_id: str):
+    # Placeholder for future secure mode; not used in Quick mode
+    raise RuntimeError("Service account download not configured in Quick mode.")
+
+def load_excel_from_google_drive(sheet_name=" "):
+    last_exc = None
+    # 1) Try direct download if URL provided
+    if GOOGLE_DRIVE_URL:
+        try:
+            content = _download_via_direct_link(GOOGLE_DRIVE_URL)
+            print("[Drive] downloaded via direct link")
+            return pd.read_excel(io.BytesIO(content), sheet_name=sheet_name, header=None)
+        except Exception as e:
+            last_exc = e
+            print("[Drive] direct download failed:", repr(e))
+
+    # 2) Try explicit file id with direct uc link
+    fid = GOOGLE_DRIVE_FILE_ID or _extract_drive_file_id(GOOGLE_DRIVE_URL or "")
+    if fid:
+        try:
+            dl = f"https://drive.google.com/uc?export=download&id={fid}"
+            content = _download_via_direct_link(dl)
+            print("[Drive] downloaded via explicit file id")
+            return pd.read_excel(io.BytesIO(content), sheet_name=sheet_name, header=None)
+        except Exception as e:
+            last_exc = e
+            print("[Drive] explicit file id download failed:", repr(e))
+
+    guidance = (
+        "Failed to download Excel from Google Drive. Last error: {}\n"
+        "Possible causes:\n"
+        "- The share link is not set to Anyone with the link.\n"
+        "- Google returned an HTML page (virus scan or preview) instead of file.\n"
+        "- The link is not a direct download link.\n\n"
+        "Fix options:\n"
+        "1) Make file shareable Anyone with the link and set GOOGLE_DRIVE_URL to the uc?export=download link.\n"
+        "2) Provide GOOGLE_DRIVE_FILE_ID and ensure the file is shared.\n"
+    ).format(last_exc)
+    raise RuntimeError(guidance)
+
+# ====== Logging user queries ======
 def save_log(user_id, name, company, question, timestamp):
     try:
         try:
@@ -96,9 +132,9 @@ def save_log(user_id, name, company, question, timestamp):
         ws.append([user_id, name, company, question, timestamp])
         wb.save(LOG_FILE)
     except Exception as e:
-        print(f"❌ Lỗi ghi log: {e}")
+        print("❌ Lỗi ghi log:", e)
 
-# ====== Telegram send helper (synchronous) ======
+# ====== Telegram helper ======
 TELEGRAM_API = f"https://api.telegram.org/bot{TOKEN}"
 
 def send_message(chat_id: int, text: str, parse_mode: str = None):
@@ -114,7 +150,7 @@ def send_message(chat_id: int, text: str, parse_mode: str = None):
         print("Failed to send message:", e, resp.text if 'resp' in locals() else "")
         return None
 
-# ====== Core synchronous update handling (keeps same UX as before) ======
+# ====== Core handling ======
 def handle_update_sync(update_json: dict):
     msg = update_json.get("message", {})
     if not msg:
@@ -129,7 +165,6 @@ def handle_update_sync(update_json: dict):
     if not chat_id or not user_id:
         return
 
-    # Commands
     if text.startswith("/start"):
         user_data[user_id] = {"step": "name"}
         send_message(chat_id, "Xin chào! Vui lòng nhập Tên của bạn:")
@@ -138,32 +173,29 @@ def handle_update_sync(update_json: dict):
     if text.startswith("/help"):
         help_text = (
             "📖 Hướng dẫn sử dụng bot:\n\n"
-            "- /start: Bắt đầu trò chuyện với bot (yêu cầu nhập Tên và Công ty).\n"
-            "- /list_dest: Liệt kê toàn bộ mã Dest trong cột B.\n"
-            "- /help: Hiển thị hướng dẫn chi tiết.\n\n"
-            "Sau khi nhập đủ thông tin, bạn có thể gõ trực tiếp mã Dest (ví dụ: SIN, CGK, BKK, KUL) "
-            "để nhận thông tin chi tiết."
+            "- /start: Bắt đầu.\n"
+            "- /list_dest: Liệt kê mã Dest.\n"
+            "- /help: Hiển thị hướng dẫn."
         )
         send_message(chat_id, help_text)
         return
 
     if text.startswith("/list_dest"):
         try:
-            df = load_excel_from_onedrive(sheet_name=" ")
+            df = load_excel_from_google_drive(sheet_name=" ")
             dest_values = df[1].dropna().unique()
             dest_list = ", ".join(sorted(dest_values.astype(str)))
             answer = f"📋 Danh sách tất cả Dest trong cột B:\n{dest_list}"
         except Exception as e:
             answer = f"⚠️ Có lỗi xảy ra khi đọc file: {e}"
+            print("[Error] list_dest:", e)
         send_message(chat_id, answer)
         return
 
-    # Conversation flow: name -> company -> done
     state = user_data.get(user_id, {})
     step = state.get("step")
 
     if step == "name":
-        # Save name, ask company
         user_data[user_id]["name"] = text
         user_data[user_id]["step"] = "company"
         send_message(chat_id, "Cảm ơn! Bây giờ hãy nhập Tên công ty:")
@@ -179,12 +211,11 @@ def handle_update_sync(update_json: dict):
         send_message(chat_id, "⚠️ Vui lòng nhập Tên và Công ty trước bằng lệnh /start.")
         return
 
-    # Now user is in 'done' state: treat text as Dest query
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     save_log(user_id, user_data[user_id].get("name", ""), user_data[user_id].get("company", ""), text, timestamp)
 
     try:
-        df = load_excel_from_onedrive(sheet_name=" ")
+        df = load_excel_from_google_drive(sheet_name=" ")
         row = df[df[1].astype(str).str.strip().str.lower() == text.lower()]
 
         if not row.empty:
@@ -209,22 +240,23 @@ def handle_update_sync(update_json: dict):
                 f"- Valid from: {k_val}\n"
                 f"- Valid till: {l_val}\n\n"
                 f"📌 Thông tin bổ sung:\n{extra_text}\n\n"
-                f"🔗 <a href='{OUTLOOK_LINK}'>Space Outlook</a>\n"
-                f"🔗 <a href='{TACT_LINK}'>TACT Rate</a>"
+                f"🔗 {OUTLOOK_LINK}\n"
+                f"🔗 {TACT_LINK}"
             )
         else:
             answer = (
                 "Xin lỗi, chưa có dữ liệu cho giá trị này.\n"
                 "👉 Bạn có thể dùng lệnh /list_dest để xem danh sách Dest có sẵn.\n\n"
-                f"🔗 <a href='{OUTLOOK_LINK}'>Space Outlook</a>\n"
-                f"🔗 <a href='{TACT_LINK}'>TACT Rate</a>"
+                f"🔗 {OUTLOOK_LINK}\n"
+                f"🔗 {TACT_LINK}"
             )
     except Exception as e:
         answer = f"⚠️ Có lỗi xảy ra khi tra cứu: {e}"
+        print("[Error] lookup:", e)
 
     send_message(chat_id, answer, parse_mode="HTML")
 
-# ====== Helper: set webhook via Telegram API (synchronous) ======
+# ====== Webhook setup helper ======
 def set_telegram_webhook(webhook_url: str):
     url = f"https://api.telegram.org/bot{TOKEN}/setWebhook"
     resp = requests.post(url, data={"url": webhook_url}, timeout=15)
@@ -238,15 +270,10 @@ def set_telegram_webhook(webhook_url: str):
 if __name__ == "__main__":
     webhook_url = RENDER_URL.rstrip("/") + f"/{WEBHOOK_PATH}"
     print("Webhook URL will be:", webhook_url)
-
-    # Try to set webhook (best-effort)
     try:
         res = set_telegram_webhook(webhook_url)
         print("✅ Telegram webhook set to:", webhook_url)
     except Exception as e:
         print("⚠️ setWebhook failed (will still run):", e)
-
-    # Start Flask (this will receive webhook POSTs and health checks)
-    # Use Flask dev server here; Render maps external port to container port.
     print("Starting Flask on port", PORT)
     app.run(host="0.0.0.0", port=PORT)
