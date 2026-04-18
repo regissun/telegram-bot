@@ -12,11 +12,11 @@ from openpyxl import Workbook, load_workbook
 
 # ====== Cấu hình ======
 LOG_FILE = "bot_user_log.xlsx"
-OUTLOOK_LINK = os.getenv("OUTLOOK_LINK", "")
-TACT_LINK = os.getenv("TACT_LINK", "")
+OUTLOOK_LINK = os.getenv("OUTLOOK_LINK", "https://example.com/outlook")
+TACT_LINK = os.getenv("TACT_LINK", "https://example.com/tact")
 
 TOKEN = os.getenv("TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
-GOOGLE_DRIVE_URL = os.getenv("GOOGLE_DRIVE_URL")  # share link or export link
+GOOGLE_DRIVE_URL = os.getenv("GOOGLE_DRIVE_URL")  # share/export link
 GOOGLE_DRIVE_FILE_ID = os.getenv("GOOGLE_DRIVE_FILE_ID")  # optional explicit file id
 RENDER_URL = os.getenv("RENDER_URL")
 PORT = int(os.environ.get("PORT", 10000))
@@ -74,12 +74,6 @@ def _is_google_sheets_url(url: str):
     return bool(url and "docs.google.com/spreadsheets" in url)
 
 def _build_sheets_export_url(url: str, format="xlsx"):
-    """
-    Convert a Google Sheets share/edit URL to an export URL that returns an xlsx file.
-    Example:
-    https://docs.google.com/spreadsheets/d/<FILEID>/edit?usp=sharing
-    -> https://docs.google.com/spreadsheets/d/<FILEID>/export?format=xlsx
-    """
     fid = _extract_drive_file_id(url)
     if not fid:
         return None
@@ -228,6 +222,10 @@ def send_message(chat_id: int, text: str, parse_mode: str = None):
         return None
 
 # ====== Core handling ======
+def _html_link(url: str, label: str):
+    # Simple helper to produce safe HTML anchor
+    return f"<a href=\"{url}\">{label}</a>"
+
 def handle_update_sync(update_json: dict):
     msg = update_json.get("message", {})
     if not msg:
@@ -266,6 +264,7 @@ def handle_update_sync(update_json: dict):
         except Exception as e:
             answer = f"⚠️ Có lỗi xảy ra khi đọc file: {e}"
             print("[Error] list_dest:", e)
+        # list_dest has no HTML links, plain send is fine
         send_message(chat_id, answer)
         return
 
@@ -295,6 +294,9 @@ def handle_update_sync(update_json: dict):
         df = load_excel_from_google_drive(sheet_name=" ")
         row = df[df[1].astype(str).str.strip().str.lower() == text.lower()]
 
+        outlook_anchor = _html_link(OUTLOOK_LINK, "Space Outlook")
+        tact_anchor = _html_link(TACT_LINK, "TACT Rate")
+
         if not row.empty:
             r = row.iloc[0]
             c_val = f"{r[2]:.2f}" if pd.notnull(r[2]) else ""
@@ -317,21 +319,27 @@ def handle_update_sync(update_json: dict):
                 f"- Valid from: {k_val}\n"
                 f"- Valid till: {l_val}\n\n"
                 f"📌 Thông tin bổ sung:\n{extra_text}\n\n"
-                f"🔗 {OUTLOOK_LINK}\n"
-                f"🔗 {TACT_LINK}"
+                f"🔗 {outlook_anchor}\n"
+                f"🔗 {tact_anchor}"
             )
+            # send with HTML parse mode so anchors render
+            send_message(chat_id, answer, parse_mode="HTML")
+            return
         else:
             answer = (
                 "Xin lỗi, chưa có dữ liệu cho giá trị này.\n"
                 "👉 Bạn có thể dùng lệnh /list_dest để xem danh sách Dest có sẵn.\n\n"
-                f"🔗 {OUTLOOK_LINK}\n"
-                f"🔗 {TACT_LINK}"
+                f"🔗 {outlook_anchor}\n"
+                f"🔗 {tact_anchor}"
             )
+            send_message(chat_id, answer, parse_mode="HTML")
+            return
+
     except Exception as e:
         answer = f"⚠️ Có lỗi xảy ra khi tra cứu: {e}"
         print("[Error] lookup:", e)
-
-    send_message(chat_id, answer, parse_mode="HTML")
+        send_message(chat_id, answer)
+        return
 
 # ====== Webhook setup helper ======
 def set_telegram_webhook(webhook_url: str):
