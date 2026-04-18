@@ -12,8 +12,8 @@ from openpyxl import Workbook, load_workbook
 
 # ====== Cấu hình ======
 LOG_FILE = "bot_user_log.xlsx"
-OUTLOOK_LINK = os.getenv("OUTLOOK_LINK", "https://example.com/outlook")
-TACT_LINK = os.getenv("TACT_LINK", "https://example.com/tact")
+OUTLOOK_LINK = os.getenv("OUTLOOK_LINK", "https://1drv.ms/x/c/63897167e619733d/EQCzDiktLplDjqgol9KBuZEBs0yxrsbyjxw49RRTE6uCuA?e=q1QOId&nav=MTVfezAwMDAwMDAwLTAwMDEtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMH0")
+TACT_LINK = os.getenv("TACT_LINK", "https://docs.google.com/spreadsheets/d/e/2PACX-1vSxJMSJZcwlD4ZUiY0a_N1KfeAyKp2HDUGzhXWA1wDxRkU1fFCU3BjfQZnquOEtwA/pubhtml?gid=248455740&single=true")
 
 TOKEN = os.getenv("TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
 GOOGLE_DRIVE_URL = os.getenv("GOOGLE_DRIVE_URL")  # share/export link
